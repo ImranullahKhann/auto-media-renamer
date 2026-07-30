@@ -37,8 +37,8 @@ def check_ollama_status():
         print("Make sure Ollama is actively running.")
         sys.exit(1)
 
-def extract_video_frame(video_path, temp_img_path):
-    """Extract a representative middle frame from a video file."""
+def extract_video_frame_grid(video_path, temp_img_path):
+    """Extracts 4 sequential frames and stitches them into a 2x2 grid to capture action/motion."""
     cap = None
     try:
         cap = cv2.VideoCapture(video_path)
@@ -46,22 +46,37 @@ def extract_video_frame(video_path, temp_img_path):
             return False
         
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        middle_frame = total_frames // 2 if total_frames > 0 else 0
-        cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame)
-        ret, frame = cap.read()
+        if total_frames <= 0:
+            return False
         
-        if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        # Sample 4 points across the video duration (20%, 40%, 60%, 80%)
+        sample_points = [0.2, 0.4, 0.6, 0.8]
+        frames = []
+        
+        for ratio in sample_points:
+            target_frame = int(total_frames * ratio)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
             ret, frame = cap.read()
+            if ret:
+                # Downscale each frame to 320x180 so the combined 640x360 grid stays fast
+                resized = cv2.resize(frame, (320, 180))
+                frames.append(resized)
+                
+        if len(frames) == 4:
+            # Create a 2x2 contact sheet
+            top_row = cv2.hconcat([frames[0], frames[1]])
+            bottom_row = cv2.hconcat([frames[2], frames[3]])
+            grid = cv2.vconcat([top_row, bottom_row])
             
-        if ret:
-            cv2.imwrite(temp_img_path, frame)
+            cv2.imwrite(temp_img_path, grid)
             return True
+            
     except Exception as e:
-        print(f"   ⚠️ OpenCV Frame extraction error: {e}")
+        print(f"   ⚠️ OpenCV Frame grid extraction error: {e}")
     finally:
         if cap is not None:
             cap.release()
+            
     return False
 
 def sanitize_filename(name):
@@ -119,24 +134,32 @@ def analyze_media(file_path, is_video=False):
     if is_video:
         temp_dir = tempfile.gettempdir()
         temp_frame_path = os.path.join(temp_dir, "ollama_temp_frame.jpg")
-        print("   -> [STEP 1/3] Video detected. Extracting middle frame...")
-        if not extract_video_frame(file_path, temp_frame_path):
+        print("   -> [STEP 1/3] Video detected. Extracting 4-frame action sequence grid...")
+        if not extract_video_frame_grid(file_path, temp_frame_path):
             return None
         image_to_send = temp_frame_path
+        
+        prompt = (
+            "This image is a 2x2 grid showing sequential frames from a video ordered chronologically top-left, top-right, bottom-left, bottom-right. "
+            "Analyze the movement across frames and generate a highly searchable, 4 to 6 word description. "
+            "Prioritize the core subject action, motion, or gesture taking place (e.g., person_waving_hands_no, dog_running_park, man_shaking_head). "
+            "Format strictly using lowercase letters and underscores instead of spaces. Do not write any intro, conversational filler, or punctuation."
+        )
     else:
         image_to_send = file_path
-
-    prompt = (
-        "Provide a short, accurate 3 to 5 word description of this image's main subject "
-        "to be used as a filename. Format your response strictly using lowercase letters and underscores "
-        "instead of spaces. Do not write any introduction, conversational filler, punctuation, or file extensions. "
-        "Example Output: dog_running_in_park"
-    )
+        prompt = (
+            "Analyze this image and generate a highly searchable, 4 to 6 word description focusing on the primary subject, setting, and key identifying features (e.g., specific object, location, action, or color). Prioritize high-value keywords for file indexing over generic terms."
+            "Format your response strictly using lowercase letters and underscores instead of spaces."
+            f"""Examples:
+                - Input: Photo of a Golden Retriever on a beach at sunset -> golden_retriever_sunset_sandy_beach
+                - Input: Invoice document from Amazon -> amazon_receipt_invoice_document
+                - Input: Red vintage sports car -> red_vintage_convertible_sports_car
+            Do not write any introduction, conversational filler, punctuation, or file extensions."""
+        )
 
     try:
         print("   -> [STEP 2/3] Payload ready. Querying local Ollama API (waiting for response)...")
         
-        # We pass think=False directly to bypass the reasoning loop entirely
         response = client.chat(
             model=MODEL_NAME,
             messages=[{
@@ -144,26 +167,20 @@ def analyze_media(file_path, is_video=False):
                 'content': prompt,
                 'images': [image_to_send]
             }],
-            think=False,  # CRITICAL: Suppress reasoning mode
+            think=False,
             options={
                 'temperature': 0.1,
-                'num_predict': 40  # Safely expanded to 40 tokens since thinking is bypassed
+                'num_predict': 40
             }
         )
         print("   -> [STEP 3/3] Response successfully received.")
         
-        # Robust parsing fallback
         description = ""
         msg = getattr(response, 'message', None)
         if msg:
             content = getattr(msg, 'content', '')
             thinking = getattr(msg, 'thinking', '')
-            
-            # If standard content exists, use it. Otherwise, salvage the thinking block!
-            if content:
-                description = content.strip()
-            elif thinking:
-                description = thinking.strip()
+            description = content.strip() if content else thinking.strip()
                 
         return description if description else None
         
@@ -171,7 +188,6 @@ def analyze_media(file_path, is_video=False):
         print(f"   ❌ [ERROR] Ollama request failed or timed out: {e}")
         return None
     finally:
-        # Clean up temporary video frame
         if temp_frame_path and os.path.exists(temp_frame_path):
             try:
                 os.remove(temp_frame_path)
